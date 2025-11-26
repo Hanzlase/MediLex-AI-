@@ -1,99 +1,85 @@
-import gradio as gr
-import time
-from rag_backend import rag_chain
+import pandas as pd
+import os
+from dotenv import load_dotenv
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from tqdm import tqdm 
 
-# --- Logic Function ---
-def generate_response(message, history):
+load_dotenv()
+
+DATASET_PATH = os.path.join("Dataset", "mtsamples.csv")
+INDEX_PATH = "faiss_medical_index"
+
+# PART 1: Data Preparation
+print("PART 1: Data Preparation ")
+
+if not os.path.exists(DATASET_PATH):
+    raise FileNotFoundError(f"Dataset not found at {DATASET_PATH}. Please ensure the folder 'Dataset' exists.")
+
+print(f"Loading data from {DATASET_PATH}...")
+df = pd.read_csv(DATASET_PATH)
+
+df_clean = df.dropna(subset=['transcription'])
+if 'Unnamed: 0' in df_clean.columns:
+    df_clean = df_clean.drop(columns=['Unnamed: 0'])
+
+print(f"Data cleaned. Processing {len(df_clean)} records...")
+
+def prepare_context(row):
+    return f"""
+    medical_specialty: {row['medical_specialty']}
+    sample_name: {row['sample_name']}
+    transcription: {row['transcription']}
     """
-    This function handles the interaction with the RAG chain.
-    It returns the answer and formats the sources nicely.
-    """
-    if not message:
-        return ""
 
-    try:
-        # 1. Call the RAG pipeline
-        response = rag_chain.invoke(message)
-        answer = response["answer"]
-        sources = response["context"]
+df_clean['text_for_rag'] = df_clean.apply(prepare_context, axis=1)
 
-        # 2. Format Sources (Evidence) using Markdown
-        # We create a collapsible details section for cleaner UI
-        source_details = "\n\n<details><summary><b>📚 Click to view Medical Sources</b></summary>\n\n"
-        
-        for i, doc in enumerate(sources):
-            source_id = doc.metadata.get('source_id', 'N/A')
-            specialty = doc.metadata.get('specialty', 'Unknown')
-            # Clean content for display (first 300 chars)
-            content_snippet = doc.page_content[:300].replace("\n", " ") + "..."
-            
-            source_details += f"**Source #{i+1}** (ID: `{source_id}`)\n"
-            source_details += f"*Specialty: {specialty}*\n"
-            source_details += f"> {content_snippet}\n\n"
-            source_details += "---\n"
-        
-        source_details += "</details>"
-
-        # 3. Combine Answer + Sources
-        final_output = f"{answer}\n{source_details}"
-        
-        return final_output
-
-    except Exception as e:
-        error_msg = f"⚠️ **An error occurred:** {str(e)}"
-        return error_msg
-
-# --- Custom UI Theme ---
-theme = gr.themes.Soft(
-    primary_hue="cyan",
-    secondary_hue="slate",
-    neutral_hue="slate",
-    font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui"]
+print("Splitting text into chunks...")
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    separators=["\n\n", "\n", ".", " ", ""]
 )
 
-# --- Examples List ---
-example_questions = [
-    "What are the symptoms of allergic rhinitis?",
-    "Describe the procedure for a cardiac catheterization.",
-    "How is carpal tunnel syndrome diagnosed?",
-    "What are the indications for a colonoscopy?",
-    "What is the treatment for kidney stones?",
-]
+documents = []
+for index, row in df_clean.iterrows():
+    chunks = text_splitter.split_text(row['text_for_rag'])
+    for chunk in chunks:
+        doc = Document(
+            page_content=chunk,
+            metadata={
+                'source_id': index,
+                'specialty': row['medical_specialty']
+            }
+        )
+        documents.append(doc)
 
-# --- Build the App ---
-with gr.Blocks(theme=theme, title="MediLex AI") as demo:
-    
-    # Header Section
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown(
-                """
-                # 🩺 **MediLex AI Assistant**
-                ### *Retrieval-Augmented Generation (RAG) for Medical Queries*
-                """
-            )
-    
-    # Main Chat Layout
-    # Updated for Gradio 5.0 compatibility: Removed unsupported button args and added type="messages"
-    chat_interface = gr.ChatInterface(
-        fn=generate_response, 
-        type="messages", 
-        chatbot=gr.Chatbot(
-            height=600, 
-            show_copy_button=True, 
-            render_markdown=True,
-            type="messages",
-            avatar_images=(None, "https://cdn-icons-png.flaticon.com/512/3774/3774299.png") # User (Default), Bot (Medical Icon)
-        ),
-        textbox=gr.Textbox(placeholder="Ask a medical question here...", container=False, scale=7),
-        title=None,
-        description=None,
-        theme=theme,
-        examples=example_questions,
-        cache_examples=False,
-    )
+print(f"Prepared {len(documents)} document chunks.")
 
-# --- Launch ---
-if __name__ == "__main__":
-    print("🚀 Launching MediLex Gradio App...")
-    demo.launch()
+# PART 2: Vector Store Creation
+print("\n--- PART 2: Vector Store Creation ---")
+
+print("Initializing HuggingFace Embedding Model (Local & Free)...")
+
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+print(f"Creating FAISS Index with Progress Bar...")
+
+batch_size = 32
+total_docs = len(documents)
+
+# Create the vector store with the first batch to initialize it
+vector_store = FAISS.from_documents(documents[:batch_size], embeddings)
+
+# Process the rest in batches with a progress bar
+for i in tqdm(range(batch_size, total_docs, batch_size), desc="Embedding Documents"):
+    batch = documents[i : i + batch_size]
+    vector_store.add_documents(batch)
+
+print(f"\nSaving index to folder: '{INDEX_PATH}'...")
+vector_store.save_local(INDEX_PATH)
+
+print("Success! Database created.")
+print(f"You can now create your 'app.py' and load '{INDEX_PATH}' to query it.")
