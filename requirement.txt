@@ -1,0 +1,12 @@
+streamlit
+pandas
+langchain
+langchain-community
+langchain-core
+langchain-huggingface
+langchain-cohere
+langchain-text-splitters
+faiss-cpu
+python-dotenv
+tqdm
+sentence-transformers
